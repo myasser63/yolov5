@@ -1,0 +1,11 @@
+train:
+  - /content/DataA/train/images
+  - /content/DataB/train/images
+val:
+  - /content/DataA/valid/images
+  - /content/DataB/valid/images
+
+
+
+nc: 4
+names: ['half ripe', 'over ripe', 'ripe', 'unripe']
