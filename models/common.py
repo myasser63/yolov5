@@ -769,3 +769,617 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+#//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+# REPVGG BLOCK YOLOv7
+class SE_Block(nn.Module):
+    def __init__(self, c, r=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(c, c // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c // r, c, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        bs, c, _, _ = x.shape
+        y = self.squeeze(x).view(bs, c)
+        y = self.excitation(y).view(bs, c, 1, 1)
+        return x * y.expand_as(x)
+      
+class RepConv(nn.Module):
+    # Represented convolution
+    # https://arxiv.org/abs/2101.03697
+
+    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True, deploy=False, use_se=True):
+        super(RepConv, self).__init__()
+
+        self.deploy = deploy
+        self.groups = g
+        self.in_channels = c1
+        self.out_channels = c2
+
+#         assert k == 3
+#         assert autopad(k, p) == 1
+
+        padding_11 = autopad(k, p) - k // 2
+
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+      
+        if use_se:
+              self.se = SE_Block(c2, r=c2 // 16)
+        else:
+            self.se = nn.Identity()
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
+
+        else:
+            self.rbr_identity = (nn.BatchNorm2d(num_features=c1) if c2 == c1 and s == 1 else None)
+
+            self.rbr_dense = nn.Sequential(
+                nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2),
+            )
+
+            self.rbr_1x1 = nn.Sequential(
+                nn.Conv2d( c1, c2, 1, s, padding_11, groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2),
+            )
+
+    def forward(self, inputs):
+        if hasattr(self, "rbr_reparam"):
+            return self.act(self.rbr_reparam(inputs))
+
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+
+        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+    
+    def get_equivalent_kernel_bias(self):
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        return (
+            kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid,
+            bias3x3 + bias1x1 + biasid,
+        )
+
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        else:
+            return nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return 0, 0
+        if isinstance(branch, nn.Sequential):
+            kernel = branch[0].weight
+            running_mean = branch[1].running_mean
+            running_var = branch[1].running_var
+            gamma = branch[1].weight
+            beta = branch[1].bias
+            eps = branch[1].eps
+        else:
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, "id_tensor"):
+                input_dim = self.in_channels // self.groups
+                kernel_value = np.zeros(
+                    (self.in_channels, input_dim, 3, 3), dtype=np.float32
+                )
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def repvgg_convert(self):
+        kernel, bias = self.get_equivalent_kernel_bias()
+        return (
+            kernel.detach().cpu().numpy(),
+            bias.detach().cpu().numpy(),
+        )
+
+    def fuse_conv_bn(self, conv, bn):
+
+        std = (bn.running_var + bn.eps).sqrt()
+        bias = bn.bias - bn.running_mean * bn.weight / std
+
+        t = (bn.weight / std).reshape(-1, 1, 1, 1)
+        weights = conv.weight * t
+
+        bn = nn.Identity()
+        conv = nn.Conv2d(in_channels = conv.in_channels,
+                              out_channels = conv.out_channels,
+                              kernel_size = conv.kernel_size,
+                              stride=conv.stride,
+                              padding = conv.padding,
+                              dilation = conv.dilation,
+                              groups = conv.groups,
+                              bias = True,
+                              padding_mode = conv.padding_mode)
+
+        conv.weight = torch.nn.Parameter(weights)
+        conv.bias = torch.nn.Parameter(bias)
+        return conv
+
+    def fuse_repvgg_block(self):    
+        if self.deploy:
+            return
+        print(f"RepConv.fuse_repvgg_block")
+                
+        self.rbr_dense = self.fuse_conv_bn(self.rbr_dense[0], self.rbr_dense[1])
+        
+        self.rbr_1x1 = self.fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1])
+        rbr_1x1_bias = self.rbr_1x1.bias
+        weight_1x1_expanded = torch.nn.functional.pad(self.rbr_1x1.weight, [1, 1, 1, 1])
+        
+        # Fuse self.rbr_identity
+        if (isinstance(self.rbr_identity, nn.BatchNorm2d) or isinstance(self.rbr_identity, nn.modules.batchnorm.SyncBatchNorm)):
+            # print(f"fuse: rbr_identity == BatchNorm2d or SyncBatchNorm")
+            identity_conv_1x1 = nn.Conv2d(
+                    in_channels=self.in_channels,
+                    out_channels=self.out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=self.groups, 
+                    bias=False)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.to(self.rbr_1x1.weight.data.device)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.squeeze().squeeze()
+            # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
+            identity_conv_1x1.weight.data.fill_(0.0)
+            identity_conv_1x1.weight.data.fill_diagonal_(1.0)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.unsqueeze(2).unsqueeze(3)
+            # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
+
+            identity_conv_1x1 = self.fuse_conv_bn(identity_conv_1x1, self.rbr_identity)
+            bias_identity_expanded = identity_conv_1x1.bias
+            weight_identity_expanded = torch.nn.functional.pad(identity_conv_1x1.weight, [1, 1, 1, 1])            
+        else:
+            # print(f"fuse: rbr_identity != BatchNorm2d, rbr_identity = {self.rbr_identity}")
+            bias_identity_expanded = torch.nn.Parameter( torch.zeros_like(rbr_1x1_bias) )
+            weight_identity_expanded = torch.nn.Parameter( torch.zeros_like(weight_1x1_expanded) )            
+        
+
+        #print(f"self.rbr_1x1.weight = {self.rbr_1x1.weight.shape}, ")
+        #print(f"weight_1x1_expanded = {weight_1x1_expanded.shape}, ")
+        #print(f"self.rbr_dense.weight = {self.rbr_dense.weight.shape}, ")
+
+        self.rbr_dense.weight = torch.nn.Parameter(self.rbr_dense.weight + weight_1x1_expanded + weight_identity_expanded)
+        self.rbr_dense.bias = torch.nn.Parameter(self.rbr_dense.bias + rbr_1x1_bias + bias_identity_expanded)
+                
+        self.rbr_reparam = self.rbr_dense
+        self.deploy = True
+
+        if self.rbr_identity is not None:
+            del self.rbr_identity
+            self.rbr_identity = None
+
+        if self.rbr_1x1 is not None:
+            del self.rbr_1x1
+            self.rbr_1x1 = None
+
+        if self.rbr_dense is not None:
+            del self.rbr_dense
+            self.rbr_dense = None
+
+class RepBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = RepConv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RepC3(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+#/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#######################################################################################
+# SE BLOCK
+# https://github.com/ppogg/YOLOv5-Lite/blob/master/models/common.py
+# https://github.com/moskomule/senet.pytorch/blob/master/senet/se_module.py#L4
+
+class SE_Block(nn.Module):
+    def __init__(self, c, r=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(c, c // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c // r, c, bias=False),
+            nn.Sigmoid()
+            # nn.Hardswish()
+        )
+
+    def forward(self, x):
+        bs, c, _, _ = x.shape
+        y = self.squeeze(x).view(bs, c)
+        y = self.excitation(y).view(bs, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class C3_SE_TOP(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.SE = SE_Block(c1)
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(self.SE(x))), self.cv2(x)), 1))
+
+
+class C3_SE_PRE(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.SE = SE_Block(c1)
+
+    def forward(self, x):
+        x1 = self.SE(x)
+        x1 = self.m(self.cv1(x))
+        x2 = self.cv2(x)
+        x = self.cv3(torch.cat((x1, x2), 1))
+
+        return x
+
+
+class C3_SE_BOT(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.SE = SE_Block(c_)
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.SE(self.m(self.cv1(x))), self.cv2(x)), 1))
+
+
+class C3_SE_POST(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.SE = SE_Block(2 * c_)
+
+    def forward(self, x):
+        return self.cv3(self.SE((torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))))
+
+
+# //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+# Fca Layer
+# https://github.com/cfzd/FcaNet.git
+
+import math
+import torch
+import torch.nn as nn
+
+
+def get_freq_indices(method):
+    assert method in ['top1', 'top2', 'top4', 'top8', 'top16', 'top32',
+                      'bot1', 'bot2', 'bot4', 'bot8', 'bot16', 'bot32',
+                      'low1', 'low2', 'low4', 'low8', 'low16', 'low32']
+    num_freq = int(method[3:])
+    if 'top' in method:
+        all_top_indices_x = [0, 0, 6, 0, 0, 1, 1, 4, 5, 1, 3, 0, 0, 0, 3, 2, 4, 6, 3, 5, 5, 2, 6, 5, 5, 3, 3, 4, 2, 2,
+                             6, 1]
+        all_top_indices_y = [0, 1, 0, 5, 2, 0, 2, 0, 0, 6, 0, 4, 6, 3, 5, 2, 6, 3, 3, 3, 5, 1, 1, 2, 4, 2, 1, 1, 3, 0,
+                             5, 3]
+        mapper_x = all_top_indices_x[:num_freq]
+        mapper_y = all_top_indices_y[:num_freq]
+    elif 'low' in method:
+        all_low_indices_x = [0, 0, 1, 1, 0, 2, 2, 1, 2, 0, 3, 4, 0, 1, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 1, 2,
+                             3, 4]
+        all_low_indices_y = [0, 1, 0, 1, 2, 0, 1, 2, 2, 3, 0, 0, 4, 3, 1, 5, 4, 3, 2, 1, 0, 6, 5, 4, 3, 2, 1, 0, 6, 5,
+                             4, 3]
+        mapper_x = all_low_indices_x[:num_freq]
+        mapper_y = all_low_indices_y[:num_freq]
+    elif 'bot' in method:
+        all_bot_indices_x = [6, 1, 3, 3, 2, 4, 1, 2, 4, 4, 5, 1, 4, 6, 2, 5, 6, 1, 6, 2, 2, 4, 3, 3, 5, 5, 6, 2, 5, 5,
+                             3, 6]
+        all_bot_indices_y = [6, 4, 4, 6, 6, 3, 1, 4, 4, 5, 6, 5, 2, 2, 5, 1, 4, 3, 5, 0, 3, 1, 1, 2, 4, 2, 1, 1, 5, 3,
+                             3, 3]
+        mapper_x = all_bot_indices_x[:num_freq]
+        mapper_y = all_bot_indices_y[:num_freq]
+    else:
+        raise NotImplementedError
+    return mapper_x, mapper_y
+
+
+class MultiSpectralAttentionLayer(torch.nn.Module):
+    def __init__(self, channel, dct_h, dct_w, reduction=16, freq_sel_method='top16'):
+        super(MultiSpectralAttentionLayer, self).__init__()
+        self.reduction = reduction
+        self.dct_h = dct_h
+        self.dct_w = dct_w
+
+        mapper_x, mapper_y = get_freq_indices(freq_sel_method)
+        self.num_split = len(mapper_x)
+        mapper_x = [temp_x * (dct_h // 7) for temp_x in mapper_x]
+        mapper_y = [temp_y * (dct_w // 7) for temp_y in mapper_y]
+        # make the frequencies in different sizes are identical to a 7x7 frequency space
+        # eg, (2,2) in 14x14 is identical to (1,1) in 7x7
+
+        self.dct_layer = MultiSpectralDCTLayer(dct_h, dct_w, mapper_x, mapper_y, channel)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        n, c, h, w = x.shape
+        x_pooled = x
+        if h != self.dct_h or w != self.dct_w:
+            x_pooled = torch.nn.functional.adaptive_avg_pool2d(x, (self.dct_h, self.dct_w))
+            # If you have concerns about one-line-change, don't worry.   :)
+            # In the ImageNet models, this line will never be triggered.
+            # This is for compatibility in instance segmentation and object detection.
+        y = self.dct_layer(x_pooled)
+
+        y = self.fc(y).view(n, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class MultiSpectralDCTLayer(nn.Module):
+    """
+    Generate dct filters
+    """
+
+    def __init__(self, height, width, mapper_x, mapper_y, channel):
+        super(MultiSpectralDCTLayer, self).__init__()
+
+        assert len(mapper_x) == len(mapper_y)
+        assert channel % len(mapper_x) == 0
+
+        self.num_freq = len(mapper_x)
+
+        # fixed DCT init
+        self.register_buffer('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
+
+        # fixed random init
+        # self.register_buffer('weight', torch.rand(channel, height, width))
+
+        # learnable DCT init
+        # self.register_parameter('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
+
+        # learnable random init
+        # self.register_parameter('weight', torch.rand(channel, height, width))
+
+        # num_freq, h, w
+
+    def forward(self, x):
+        assert len(x.shape) == 4, 'x must been 4 dimensions, but got ' + str(len(x.shape))
+        # n, c, h, w = x.shape
+
+        x = x * self.weight
+
+        result = torch.sum(x, dim=[2, 3])
+        return result
+
+    def build_filter(self, pos, freq, POS):
+        result = math.cos(math.pi * freq * (pos + 0.5) / POS) / math.sqrt(POS)
+        if freq == 0:
+            return result
+        else:
+            return result * math.sqrt(2)
+
+    def get_dct_filter(self, tile_size_x, tile_size_y, mapper_x, mapper_y, channel):
+        dct_filter = torch.zeros(channel, tile_size_x, tile_size_y)
+
+        c_part = channel // len(mapper_x)
+
+        for i, (u_x, v_y) in enumerate(zip(mapper_x, mapper_y)):
+            for t_x in range(tile_size_x):
+                for t_y in range(tile_size_y):
+                    dct_filter[i * c_part: (i + 1) * c_part, t_x, t_y] = self.build_filter(t_x, u_x,
+                                                                                           tile_size_x) * self.build_filter(
+                        t_y, v_y, tile_size_y)
+
+        return dct_filter
+
+
+class C3_FCA(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        # c2wh = dict([(128,154), (256,77), (512,35) ,(1024,14)]) #FILTERS, OUTPUTSIZE
+        c2wh = dict([(64, 56), (128, 28), (256, 14), (512, 7)])
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.FCA = MultiSpectralAttentionLayer(c1, c2wh[c1], c2wh[c1])
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(self.FCA(x))), self.cv2(x)), 1))
+
+
+# //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+# CBAM BLOCK
+class BasicConv(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
+                 bn=True, bias=False):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
+        self.relu = nn.ReLU() if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
+
+
+class Flatten(nn.Module):
+    def forward(self, x):
+        return x.view(x.size(0), -1)
+
+
+class ChannelGate(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max']):
+        super(ChannelGate, self).__init__()
+        self.gate_channels = gate_channels
+        self.mlp = nn.Sequential(
+            Flatten(),
+            nn.Linear(gate_channels, gate_channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(gate_channels // reduction_ratio, gate_channels)
+        )
+        self.pool_types = pool_types
+        self.m = nn.Sigmoid()
+
+    def forward(self, x):
+        channel_att_sum = None
+        for pool_type in self.pool_types:
+            if pool_type == 'avg':
+                avg_pool = F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp(avg_pool)
+            elif pool_type == 'max':
+                max_pool = F.max_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp(max_pool)
+            elif pool_type == 'lp':
+                lp_pool = F.lp_pool2d(x, 2, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp(lp_pool)
+            elif pool_type == 'lse':
+                # LSE pool only
+                lse_pool = logsumexp_2d(x)
+                channel_att_raw = self.mlp(lse_pool)
+
+            if channel_att_sum is None:
+                channel_att_sum = channel_att_raw
+            else:
+                channel_att_sum = channel_att_sum + channel_att_raw
+
+        scale = self.m(channel_att_sum).unsqueeze(2).unsqueeze(3).expand_as(x)
+        return x * scale
+
+
+def logsumexp_2d(tensor):
+    tensor_flatten = tensor.view(tensor.size(0), tensor.size(1), -1)
+    s, _ = torch.max(tensor_flatten, dim=2, keepdim=True)
+    outputs = s + (tensor_flatten - s).exp().sum(dim=2, keepdim=True).log()
+    return outputs
+
+
+class ChannelPool(nn.Module):
+    def forward(self, x):
+        return torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
+
+
+class SpatialGate(nn.Module):
+    def __init__(self):
+        super(SpatialGate, self).__init__()
+        kernel_size = 7
+        self.compress = ChannelPool()
+        self.m = nn.Sigmoid()
+        self.spatial = BasicConv(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False)
+
+    def forward(self, x):
+        x_compress = self.compress(x)
+        x_out = self.spatial(x_compress)
+        scale = self.m(x_out)
+        return x * scale
+
+
+class CBAM(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max'], no_spatial=False):
+        super(CBAM, self).__init__()
+        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio, pool_types)
+        self.no_spatial = no_spatial
+        if not no_spatial:
+            self.SpatialGate = SpatialGate()
+
+    def forward(self, x):
+        x_out = self.ChannelGate(x)
+        if not self.no_spatial:
+            x_out = self.SpatialGate(x_out)
+        return x_out
+
+
+class Bottleneck_CBAM(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cbam = CBAM(c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cbam(self.cv2(self.cv1(x))) if self.add else self.cbam(self.cv2(self.cv1(x)))
+
+
+class C3_CBAM(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck_CBAM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.cbam = CBAM(c2)
+
+    def forward(self, x):
+        return self.cbam(self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1)))
+
+
+class C3_B_CBAM(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck_CBAM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
