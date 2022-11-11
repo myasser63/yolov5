@@ -1,11 +1,13 @@
-train:
-  - /content/DataA/train/images
-  - /content/DataB/train/images
-val:
-  - /content/DataA/valid/images
-  - /content/DataB/valid/images
-
-
+train: /content/DataA/train/images
+val: /content/DataA/valid/images
+test: /content/DataA/test/images
 
 nc: 4
 names: ['half ripe', 'over ripe', 'ripe', 'unripe']
+
+roboflow:
+  workspace: mmu-ohzyc
+  project: corrected
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/mmu-ohzyc/corrected/dataset/4
