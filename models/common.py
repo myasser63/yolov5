@@ -1594,7 +1594,7 @@ class RepBottleneck(nn.Module):
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = RepVGG(c_, c2, 3, 1, g=g)
+        self.cv2 = RepVGG(c_, c2)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
