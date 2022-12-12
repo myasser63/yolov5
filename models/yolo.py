@@ -316,7 +316,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in (RepConv, Conv, GhostConv, Bottleneck, RepBottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+        if m in (RepConv, Conv, RepVGGBlock, GhostConv, Bottleneck, RepBottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                 BottleneckCSP, C3, RepC3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepBottleneck, C3_CBAM,
                 C3_B_CBAM, C3_SE_TOP, C3_SE_BOT, C3_SE_POST, C3_SE_PRE,C3_FCA,Bottleneck_CBAM):
             c1, c2 = ch[f], args[0]
