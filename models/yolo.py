@@ -317,14 +317,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in (RepConv, Conv, RepVGGBlock, GhostConv, Bottleneck, RepBottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, RepC3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepBottleneck, C3_CBAM,
+                BottleneckCSP, C3, RepC3, RepC3_SE_PRE,C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepBottleneck, C3_CBAM,
                 C3_B_CBAM, C3_SE_TOP, C3_SE_BOT, C3_SE_POST, C3_SE_PRE,C3_FCA,Bottleneck_CBAM):
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, RepC3, C3, C3TR, C3Ghost, C3x, C3, C3_SE_TOP, C3_CBAM, C3_B_CBAM, C3_SE_BOT, C3_SE_POST, C3_SE_PRE, C3_FCA]:
+            if m in [BottleneckCSP, RepC3_SE_PRE, RepC3, C3, C3TR, C3Ghost, C3x, C3, C3_SE_TOP, C3_CBAM, C3_B_CBAM, C3_SE_BOT, C3_SE_POST, C3_SE_PRE, C3_FCA]:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
