@@ -1615,7 +1615,7 @@ class RepC3(nn.Module):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
     
- class RepC3_SE_PRE(nn.Module):
+class RepC3_SE_PRE(nn.Module):
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
