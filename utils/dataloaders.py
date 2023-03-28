@@ -2,7 +2,7 @@
 """
 Dataloaders and dataset utils
 """
-
+import copy
 import contextlib
 import glob
 import hashlib
@@ -592,7 +592,6 @@ class LoadImagesAndLabels(Dataset):
     #     print('ran dataset iter')
     #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
     #     return self
-  import copy
 
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
